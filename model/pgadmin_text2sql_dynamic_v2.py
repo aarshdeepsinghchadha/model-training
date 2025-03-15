@@ -39,6 +39,7 @@ dbpath = f"postgresql://{db_config['user']}:{db_config['password']}@{db_config['
 
 SCHEMA_CONTEXT = "schema: historical_timelogs(username, year, month, projectname, timelog), user_forecasts(ds, yhat, yhat_lower, yhat_upper, username), project_forecasts(ds, yhat, yhat_lower, yhat_upper, projectname), projects(projectid, projectname)"
 
+# Training data (unchanged, assuming it’s correct)
 training_data = [
     # Historical Timelogs - Basic Queries
     {"prompt": "list all projects I worked on", "sql": "SELECT DISTINCT projectname FROM historical_timelogs WHERE username = %s ORDER BY projectname", "params": ["username"]},
@@ -172,37 +173,35 @@ def setup_database():
     project_forecasts.to_sql('project_forecasts', conn, if_exists='replace', index=False)
     projects = pd.read_csv(os.path.join(root_dir, 'data', 'v4', 'projects_v4.csv'))
     projects.to_sql('projects', conn, if_exists='replace', index=False)
-    print("Database setup complete with CSV data loaded.")
+    logging.info("Database setup complete with CSV data loaded.")
 
 def get_all_usernames(engine):
     query = "SELECT DISTINCT username FROM historical_timelogs ORDER BY username;"
-    print(f"SQL Query: {query}")
     return pd.read_sql_query(query, engine)['username'].tolist()
 
 def get_all_projects(engine):
     query = "SELECT projectname FROM projects ORDER BY projectname;"
-    print(f"SQL Query: {query}")
     return pd.read_sql_query(query, engine)['projectname'].tolist()
 
-def train_model():
+def train_model(force_retrain=False):
+    if os.path.exists(model_dir) and not force_retrain:
+        logging.info(f"Model already exists at {model_dir}. Skipping training.")
+        return
+
     if os.path.exists(model_dir):
         shutil.rmtree(model_dir)
-        logging.info(f"Removed existing model directory at {model_dir} to force retraining.")
+        logging.info(f"Removed existing model directory at {model_dir} for retraining.")
 
-    model_name = "t5-small"  # Switch to t5-small for efficiency
+    model_name = "t5-small"
     tokenizer = T5Tokenizer.from_pretrained(model_name, legacy=False)
     model = T5ForConditionalGeneration.from_pretrained(model_name)
 
     def preprocess_data(examples):
         inputs = [f"{prompt} | {SCHEMA_CONTEXT}" for prompt in examples['prompt']]
         targets = examples['sql']
-        model_inputs = tokenizer(inputs, max_length=256, truncation=True, padding="max_length")  # Increased max_length
-        labels = tokenizer(targets, max_length=256, truncation=True, padding="max_length")
+        model_inputs = tokenizer(inputs, max_length=512, truncation=True, padding="max_length")
+        labels = tokenizer(targets, max_length=512, truncation=True, padding="max_length")
         model_inputs["labels"] = labels["input_ids"]
-        logging.info(f"Tokenized inputs sample: {inputs[:1]}")
-        logging.info(f"Tokenized targets sample: {targets[:1]}")
-        logging.info(f"Input IDs sample: {model_inputs['input_ids'][0][:10]}")
-        logging.info(f"Label IDs sample: {model_inputs['labels'][0][:10]}")
         return model_inputs
 
     dataset = Dataset.from_pandas(pd.DataFrame(training_data))
@@ -214,16 +213,18 @@ def train_model():
 
     training_args = TrainingArguments(
         output_dir="./t5_text2sql",
-        num_train_epochs=100,
-        per_device_train_batch_size=8,  # Adjusted for t5-small
-        per_device_eval_batch_size=8,
+        num_train_epochs=50,  # Reduced epochs for faster training, adjust as needed
+        per_device_train_batch_size=16,  # Increased batch size
+        per_device_eval_batch_size=16,
         eval_strategy="epoch",
         save_steps=500,
         save_total_limit=2,
         logging_dir='./logs',
         logging_steps=10,
-        learning_rate=2e-5,  # Slightly higher for faster convergence
+        learning_rate=5e-5,  # Adjusted learning rate
         weight_decay=0.01,
+        warmup_steps=500,  # Added warmup for better training stability
+        fp16=True,  # Enable mixed precision for faster training
     )
 
     trainer = Trainer(
@@ -242,50 +243,39 @@ def generate_sql(prompt, username, tokenizer, model):
     year_matches = re.findall(r'\b(20\d{2})\b', prompt)
     years = year_matches if year_matches else []
 
-    input_prompt = prompt.replace("i have", "user has").replace("me", "user")
+    input_prompt = prompt.lower().replace("i have", "user has").replace("me", "user").replace("my", "user's")
     for i, year in enumerate(years):
         input_prompt = input_prompt.replace(year, f"%s_{i}")
-    
+
     input_text = f"{input_prompt} | {SCHEMA_CONTEXT}"
-    inputs = tokenizer(input_text, return_tensors="pt", max_length=256, truncation=True, padding="max_length")
-    outputs = model.generate(**inputs, max_length=256, num_beams=4, do_sample=False)
-    sql_query = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    logging.info(f"Raw model output: {outputs}")
+    inputs = tokenizer(input_text, return_tensors="pt", max_length=512, truncation=True, padding="max_length")
+    outputs = model.generate(
+        **inputs,
+        max_length=512,
+        num_beams=5,  # Increased beams for better results
+        early_stopping=True,
+        temperature=0.7,  # Add slight randomness to avoid empty outputs
+    )
+    sql_query = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     logging.info(f"Generated SQL Query: {sql_query}")
 
-    if not sql_query.strip() or all(token == 0 for token in outputs[0]):
-        logging.warning("Generated SQL query is empty or all padding tokens. Using fallback.")
-        if "show my hours for" in prompt.lower() and len(years) == 1:
-            sql_query = "SELECT month, SUM(timelog) AS total_hours FROM historical_timelogs WHERE username = %s AND year = %s GROUP BY month ORDER BY month"
-            params = (username, years[0])  # Tuple format
-            return sql_query, params
+    if not sql_query or "SELECT" not in sql_query.upper():
+        logging.warning("Generated SQL query is invalid or empty. Using fallback.")
+        for data in training_data:
+            if data["prompt"].lower() in prompt.lower():
+                sql_query = data["sql"]
+                params = tuple([username] + years[:len(data["params"]) - 1])
+                return sql_query, params
         return None, ()
 
-    params = ()
+    params = []
     if "%s" in sql_query:
-        if "username" in sql_query.lower() and years:
-            if len(years) == 1:
-                params = (username, years[0])
-                sql_query = sql_query % params
-            elif len(years) == 2:
-                params = (username, years[0], years[1])
-                sql_query = sql_query % params
-        elif "username" in sql_query.lower():
-            params = (username,)
-            sql_query = sql_query % params
-        elif years:
-            if len(years) == 1:
-                params = (years[0],)
-                sql_query = sql_query % params
-            elif len(years) == 2:
-                params = (years[0], years[1])
-                sql_query = sql_query % params
-    
-    return sql_query, params
+        if "username" in sql_query.lower():
+            params.append(username)
+        params.extend(years[:sql_query.count("%s") - len(params)])
+    return sql_query, tuple(params)
 
 def parse_prompt(prompt, username, engine, projects, tokenizer, model):
-    doc = nlp(prompt.lower())
-    
     sql_query, params = generate_sql(prompt, username, tokenizer, model)
     if sql_query is None:
         return None, None
@@ -304,7 +294,8 @@ def parse_prompt(prompt, username, engine, projects, tokenizer, model):
 def handle_user_prompt():
     engine = create_engine(dbpath)
 
-    train_model()
+    # Train only if model doesn't exist
+    train_model(force_retrain=False)
     tokenizer = T5Tokenizer.from_pretrained(model_dir, legacy=False)
     model = T5ForConditionalGeneration.from_pretrained(model_dir)
 
@@ -323,7 +314,7 @@ def handle_user_prompt():
         print("Username not found. Please try again.")
 
     while True:
-        prompt = input(f"\nEnter your request for {username} (e.g., 'Show my hours for 2022', 'List all projects I worked on with total hours', 'Which month in 2014 I worked the most') or type 'exit' to quit: ").strip()
+        prompt = input(f"\nEnter your request for {username} (e.g., 'Show my hours for 2022') or type 'exit' to quit: ").strip()
         
         if prompt.lower() == 'exit':
             print("Exiting program. Goodbye!")
